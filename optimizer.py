@@ -84,18 +84,12 @@ def RC(w, Sigma):
     sigma = sigma_p(w, Sigma)
     return (w * (Sigma @ w)) / sigma
 
-def objective_linearized(x, Sigma, b, c_cost, N):
-    w = x[:N]
-    u = x[N:2*N]
-    v = x[2*N:]
-    rc = RC(w, Sigma)
-    risk = np.sum((rc - b) ** 2)
-    turnover = c_cost * np.sum(u + v)
-    return risk + turnover
-
+# ------------------------------------------------------------
+# RISK_PAR converted to convex formulation (Roncalli 2010)
+# ------------------------------------------------------------
 def RISK_PAR(data, w_prev, N):
     Sigma = data.cov().values
-    Sigma += np.eye(N) * 1e-6
+    Sigma += np.eye(N) * 1e-6          # regularization
     if w_prev is None:
         w_prev = np.ones(N) / N
     w_t = w_prev.flatten()
@@ -103,24 +97,35 @@ def RISK_PAR(data, w_prev, N):
     current_price_relative = 1 + last_returns
     numerator = w_t * current_price_relative
     w_t_drift = numerator / max(np.sum(numerator), 1e-8)
-    w0 = w_t_drift.copy()
-    u0 = np.zeros(N)
-    v0 = np.zeros(N)
-    x0 = np.concatenate([w0, u0, v0])
-    b = (np.ones(N) / N) * sigma_p(w0, Sigma)
+
+    # Equal risk budgets
+    b = np.ones(N) / N
+
+    w = cp.Variable(N)
+    # Convex objective: 0.5 * w^T Sigma w - sum(b_i * log(w_i)) + c * ||w - w_t_drift||_1
+    objective = cp.Minimize(
+        0.5 * cp.quad_form(w, Sigma)
+        - cp.sum(cp.multiply(b, cp.log(w)))   # elementwise multiplication
+        + c * cp.norm(w - w_t_drift, 1)
+    )
     constraints = [
-        {'type': 'eq', 'fun': lambda x: np.sum(x[:N]) - 1},
-        {'type': 'eq', 'fun': lambda x: x[:N] - w_t_drift - x[N:2*N] + x[2*N:]},
-        {'type': 'ineq', 'fun': lambda x: tau - np.sum(x[N:2*N] + x[2*N:])}
+        cp.sum(w) == 1,
+        w >= 1e-8,                         # ensures log is defined
+        cp.norm(w - w_t_drift, 1) <= tau
     ]
-    bounds = [(0.0, 1.0) for _ in range(N)] + [(0.0, 1.0) for _ in range(2*N)]
-    result = minimize(objective_linearized, x0, args=(Sigma, b, c, N),
-                      method='SLSQP', bounds=bounds, constraints=constraints,
-                      options={'ftol':1e-8, 'maxiter':1000, 'disp':False})
-    if not result.success:
+    problem = cp.Problem(objective, constraints)
+    try:
+        problem.solve(solver=cp.CLARABEL, verbose=False)
+    except:
+        try:
+            problem.solve(solver=cp.SCS, verbose=False)
+        except:
+            pass
+
+    if w.value is None:
         return w_t_drift, 0.0
-    optimized_w = result.x[:N]
-    actual_turnover = np.sum(np.abs(optimized_w - w_t_drift))
+    optimized_w = np.array(w.value).squeeze()
+    actual_turnover = np.linalg.norm(optimized_w - w_t_drift, ord=1)
     cost_val = c * actual_turnover
     return optimized_w, cost_val
 
@@ -421,7 +426,7 @@ def cost_inspection_backtest(tickers, window=252, start="", end=""):
                 # Annualized turnover (average daily L1 norm * 252)
                 daily_turn = np.sum(np.abs(np.diff(w_aligned, axis=0)), axis=1)
                 avg_turn = np.mean(daily_turn) if len(daily_turn)>0 else 0.0
-                annual_turn = avg_turn * 252
+                annual_turn = avg_turn * 252 / len(common_idx) * 100
                 metrics_by_strategy[strategy]['Turnover'][cost_idx, tau_idx] = annual_turn
 
     total_elapsed = time.time() - overall_start
@@ -455,7 +460,7 @@ def cost_inspection_backtest(tickers, window=252, start="", end=""):
         # Annualized turnover
         daily_turn = np.sum(np.abs(np.diff(w, axis=0)), axis=1)
         avg_turn = np.mean(daily_turn) if len(daily_turn)>0 else 0.0
-        annual_turn = avg_turn * 252
+        annual_turn = avg_turn * 252 / len(common_idx)
         # Sharpe
         sharpe = (np.mean(excess_ret) / (np.std(excess_ret)+1e-8)) * np.sqrt(252) if np.std(excess_ret)>0 else 0
         wealth = np.cumprod(1+port_ret)
@@ -632,7 +637,7 @@ def evaluate_robust_weights(start, end):
         # Annualized turnover
         daily_turn = np.sum(np.abs(np.diff(w, axis=0)), axis=1)
         avg_turn = np.mean(daily_turn) if len(daily_turn) > 0 else 0.0
-        annual_turn = avg_turn * 252
+        annual_turn = avg_turn * 252 / len(common)
 
         # Sharpe ratio
         sharpe = (np.mean(excess_ret) / (np.std(excess_ret) + 1e-8)) * np.sqrt(252) if np.std(excess_ret) > 0 else 0
